@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+**/target/
+**/node_modules/
+frontend/dist/
+*.log
+.idea/
+.DS_Store
+playwright-report/
+test-results/
+*.tsbuildinfo
+backups/

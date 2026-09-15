@@ -1,0 +1,9 @@
+.git
+**/node_modules
+**/target
+frontend/dist
+**/*.tsbuildinfo
+.env
+.env.*
+backups
+*.log
