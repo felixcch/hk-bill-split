@@ -1,0 +1,26 @@
+server:
+  port: ${PORT:8080}
+  error:
+    include-message: never
+    include-stacktrace: never
+spring:
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/billsplit}
+    username: ${DATABASE_USERNAME:billsplit}
+    password: ${DATABASE_PASSWORD:}
+    hikari:
+      maximum-pool-size: 5
+      connection-init-sql: SET search_path TO billsplit
+  flyway:
+    schemas: billsplit
+    default-schema: billsplit
+  mvc:
+    problemdetails:
+      enabled: false
+app:
+  auth:
+    issuer: ${SUPABASE_URL:}/auth/v1
+    jwk-set-uri: ${SUPABASE_URL:}/auth/v1/.well-known/jwks.json
+    audience: authenticated
+  supabase-url: ${SUPABASE_URL:}
+  supabase-publishable-key: ${SUPABASE_PUBLISHABLE_KEY:}
