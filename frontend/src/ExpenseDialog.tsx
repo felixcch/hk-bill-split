@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import type { Request } from './api'
+import { ApiError, type Request } from './api'
 import type { Expense, ExpenseInput, Member, SplitMethod } from './types'
 import { currency, decimal, preview } from './money'
 import { Dialog, ErrorMessage, Field } from './ui'
@@ -24,6 +24,9 @@ export function ExpenseDialog({ api, groupId, members, me, expense, done, close 
   const save = useMutation({
     mutationFn: (input: ExpenseInput) => api<Expense>(expense ? `/expenses/${expense.id}` : `/groups/${groupId}/expenses`, expense ? 'PATCH' : 'POST', input, expense ? undefined : operation),
     onSuccess: done,
+    onError: error => {
+      if (error instanceof ApiError && error.status === 400) setLockedPayload(null)
+    },
   })
   const frozen = save.isPending || lockedPayload !== null
   return <Dialog title={expense ? '修改支出' : '記低一筆支出'} onClose={save.isPending ? () => {} : close}>
