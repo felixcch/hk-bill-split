@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
-import type { Request } from './api'
+import { ApiError, type Request } from './api'
 import type { Member, PaymentMethod, Settlement } from './types'
 import { cents, decimal } from './money'
 import { Dialog, ErrorMessage, Field } from './ui'
@@ -17,7 +17,13 @@ export function RepaymentDialog({ api, groupId, members, me, initial, done, clos
   const [operation] = useState(() => crypto.randomUUID())
   const [locked, setLocked] = useState<Input | null>(null)
   const [validation, setValidation] = useState<Error | null>(null)
-  const save = useMutation({ mutationFn: (input: Input) => api<Settlement>(`/groups/${groupId}/settlements`, 'POST', input, operation), onSuccess: done })
+  const save = useMutation({
+    mutationFn: (input: Input) => api<Settlement>(`/groups/${groupId}/settlements`, 'POST', input, operation),
+    onSuccess: done,
+    onError: error => {
+      if (error instanceof ApiError && error.status === 400) setLocked(null)
+    },
+  })
   return <Dialog title="記低已轉出嘅還款" onClose={save.isPending ? () => {} : close}>
     <p className="notice">請先用 FPS、PayMe、銀行或現金付款。呢度只記錄還款，對方確認收款後先會更新結餘。</p>
     <form onSubmit={e => {
