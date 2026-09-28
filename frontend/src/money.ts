@@ -14,6 +14,31 @@ export function cents(input: string): number {
   return value
 }
 
+/** Evaluates simple sums like `120+80-15.5` or `300/4` to a 2-decimal amount string; passthrough otherwise. */
+export function evaluate(expression: string): string {
+  const text = expression.replace(/\s+/g, '').replace(/[×xX]/g, '*').replace(/÷/g, '/')
+  if (!/^[\d.]+([+\-*/][\d.]+)*$/.test(text)) return expression.trim()
+  const tokens = text.match(/\d+(\.\d+)?|[+\-*/]/g) ?? []
+  const values: number[] = []
+  const ops: string[] = []
+  const apply = () => {
+    const op = ops.pop()
+    const b = values.pop() ?? 0
+    const a = values.pop() ?? 0
+    values.push(op === '+' ? a + b : op === '-' ? a - b : op === '*' ? a * b : a / b)
+  }
+  for (const token of tokens) {
+    if (/[+\-*/]/.test(token)) {
+      while (ops.length && (ops[ops.length - 1] === '*' || ops[ops.length - 1] === '/' || token === '+' || token === '-')) apply()
+      ops.push(token)
+    } else values.push(Number(token))
+  }
+  while (ops.length) apply()
+  const result = values[0]
+  if (!Number.isFinite(result) || result < 0) return expression.trim()
+  return (Math.round(result * 100) / 100).toFixed(2).replace(/\.00$/, '')
+}
+
 export function preview(amount: string, method: SplitMethod, participants: Participant[]): Share[] {
   const total = cents(amount)
   if (!total || !participants.length) throw new Error('請輸入金額，並選擇最少一位成員。')
