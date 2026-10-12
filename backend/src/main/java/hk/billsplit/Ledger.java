@@ -4,106 +4,94 @@ import static hk.billsplit.Api.*;
 
 import java.time.*;
 import java.util.*;
-import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.*;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class Ledger {
+  private static final ZoneId HONG_KONG = ZoneId.of("Asia/Hong_Kong");
   private final JdbcClient db;
   private final Groups groups;
-  private static final RowMapper<Settlement> SETTLEMENT =
-      (r, n) ->
-          new Settlement(
-              r.getObject("id", UUID.class),
-              r.getObject("group_id", UUID.class),
-              r.getObject("sender_member_id", UUID.class),
-              r.getObject("recipient_member_id", UUID.class),
-              r.getLong("amount_minor"),
-              PaymentMethod.valueOf(r.getString("method")),
-              r.getString("status"),
-              r.getInt("version"),
-              Groups.instant(r, "created_at"),
-              Groups.instant(r, "confirmed_at"));
 
   public Ledger(JdbcClient db, Groups groups) {
     this.db = db;
     this.groups = groups;
   }
 
-  private record Retry(String operation, String fingerprint, UUID resultId) {}
+  private static void checkDate(LocalDate date) {
+    LocalDate today = LocalDate.now(HONG_KONG);
+    if (date.isBefore(LocalDate.of(2000, 1, 1)) || date.isAfter(today))
+      throw ApiException.invalid("INVALID_DATE");
+  }
 
-  private UUID retry(UUID actor, UUID key, String operation, String payload) {
-    String fingerprint = Groups.hash(payload);
+  /** Returns a previously completed result for a repeated key, or null when the key is fresh. */
+  private UUID retry(UUID group, UUID key, String operation, String payload) {
+    String fingerprint = Groups.hash(operation + "\n" + payload);
     db.sql(
             """
-        INSERT INTO idempotency(actor_id, operation_key, operation, fingerprint)
-        VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING
+        INSERT INTO idempotency(group_id, key, operation, fingerprint) VALUES (?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
         """)
-        .params(actor, key, operation, fingerprint)
+        .params(group, key, operation, fingerprint)
         .update();
-    Retry row =
-        db.sql("SELECT * FROM idempotency WHERE actor_id=? AND operation_key=? FOR UPDATE")
-            .params(actor, key)
-            .query(
-                (r, n) ->
-                    new Retry(
-                        r.getString("operation"),
-                        r.getString("fingerprint"),
-                        r.getObject("result_id", UUID.class)))
-            .single();
-    if (!row.operation().equals(operation) || !row.fingerprint().equals(fingerprint))
-      throw ApiException.conflict("IDEMPOTENCY_CONFLICT");
-    return row.resultId();
+    return db.sql(
+            "SELECT operation, fingerprint, result_id FROM idempotency WHERE group_id=? AND key=? FOR UPDATE")
+        .params(group, key)
+        .query(
+            (r, n) -> {
+              if (!r.getString("operation").equals(operation)
+                  || !r.getString("fingerprint").equals(fingerprint))
+                throw ApiException.conflict("IDEMPOTENCY_MISMATCH");
+              UUID result = r.getObject("result_id", UUID.class);
+              if (result == null) return Optional.<UUID>empty();
+              return Optional.of(result);
+            })
+        .single()
+        .orElse(null);
   }
 
-  private void complete(UUID actor, UUID key, UUID result) {
-    db.sql("UPDATE idempotency SET result_id=? WHERE actor_id=? AND operation_key=?")
-        .params(result, actor, key)
+  private void complete(UUID group, UUID key, UUID result) {
+    db.sql("UPDATE idempotency SET result_id=? WHERE group_id=? AND key=?")
+        .params(result, group, key)
         .update();
   }
 
-  private List<Share> validate(UUID actor, UUID group, ExpenseInput input) {
-    Set<UUID> members =
-        new HashSet<>(groups.members(actor, group).stream().map(Member::id).toList());
-    if (!members.contains(input.payerMemberId())
-        || input.participants().stream().anyMatch(p -> !members.contains(p.memberId())))
-      throw ApiException.invalid("INVALID_MEMBER");
-    if (input.incurredOn().isBefore(LocalDate.of(2000, 1, 1))
-        || input.incurredOn().isAfter(LocalDate.now(ZoneId.of("Asia/Hong_Kong"))))
-      throw ApiException.invalid("INVALID_DATE");
+  private List<Share> validate(UUID group, ExpenseInput input) {
+    groups.member(group, input.payerMemberId());
+    for (Participant p : input.participants()) groups.member(group, p.memberId());
+    checkDate(input.incurredOn());
     return Money.split(
         Money.cents(input.amount(), false), input.splitMethod(), input.participants());
   }
 
   @Transactional
-  public Expense createExpense(UUID actor, UUID group, UUID key, ExpenseInput input) {
-    groups.membership(actor, group);
-    groups.writable(group);
-    UUID previous = retry(actor, key, "expense:" + group, input.toString());
-    if (previous != null) return expense(actor, previous);
-    List<Share> shares = validate(actor, group, input);
+  public Expense createExpense(UUID group, UUID actor, UUID key, ExpenseInput input) {
+    groups.lock(group);
+    UUID previous = retry(group, key, "CREATE_EXPENSE", input.toString());
+    if (previous != null) return expense(group, previous);
+    List<Share> shares = validate(group, input);
     UUID id = UUID.randomUUID();
     db.sql(
             """
-        INSERT INTO expense(id, group_id, payer_member_id, created_by, description,
-          amount_minor, split_method, incurred_on) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO expense(id, group_id, payer_member_id, description, category, amount_minor,
+          split_method, incurred_on) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """)
         .params(
             id,
             group,
             input.payerMemberId(),
-            actor,
-            input.description().strip(),
+            Groups.clean(input.description()),
+            input.category().name(),
             Money.cents(input.amount(), false),
             input.splitMethod().name(),
             input.incurredOn())
         .update();
     saveShares(id, group, shares);
-    Expense result = expense(actor, id);
-    groups.audit(group, actor, id, "EXPENSE_CREATED", result.toString());
-    complete(actor, key, id);
+    Expense result = expense(group, id);
+    groups.activity(group, actor, id, "EXPENSE_ADDED", result.toString());
+    complete(group, key, id);
     return result;
   }
 
@@ -117,209 +105,177 @@ public class Ledger {
     }
   }
 
-  private Expense row(UUID id) {
-    List<Share> shares =
-        db.sql(
-                "SELECT member_id, amount_minor FROM expense_share WHERE expense_id=? ORDER BY member_id")
-            .param(id)
-            .query(
-                (r, n) ->
-                    new Share(r.getObject("member_id", UUID.class), r.getLong("amount_minor")))
-            .list();
-    return db.sql("SELECT * FROM expense WHERE id=?")
-        .param(id)
+  private Map<UUID, List<Share>> shares(UUID group) {
+    Map<UUID, List<Share>> result = new HashMap<>();
+    db.sql(
+            "SELECT expense_id, member_id, amount_minor FROM expense_share WHERE group_id=? ORDER BY member_id")
+        .param(group)
         .query(
-            (r, n) ->
-                new Expense(
-                    r.getObject("id", UUID.class),
-                    r.getObject("group_id", UUID.class),
-                    r.getObject("payer_member_id", UUID.class),
-                    r.getObject("created_by", UUID.class),
-                    r.getString("description"),
-                    r.getLong("amount_minor"),
-                    SplitMethod.valueOf(r.getString("split_method")),
-                    r.getObject("incurred_on", LocalDate.class),
-                    r.getInt("version"),
-                    Groups.instant(r, "voided_at"),
-                    shares))
-        .optional()
-        .orElseThrow(ApiException::missing);
+            (r, n) -> {
+              result
+                  .computeIfAbsent(r.getObject("expense_id", UUID.class), k -> new ArrayList<>())
+                  .add(new Share(r.getObject("member_id", UUID.class), r.getLong("amount_minor")));
+              return n;
+            })
+        .list();
+    return result;
   }
 
-  @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-  public Expense expense(UUID actor, UUID id) {
-    Expense expense = row(id);
-    groups.membership(actor, expense.groupId());
-    return expense;
-  }
-
-  @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-  public Page<Expense> expenses(UUID actor, UUID group, int offset) {
-    groups.membership(actor, group);
-    List<UUID> ids =
-        db.sql(
-                """
-        SELECT id FROM expense WHERE group_id=? ORDER BY incurred_on DESC, created_at DESC, id DESC LIMIT 51 OFFSET ?
+  private List<Expense> expenses(UUID group, UUID only) {
+    Map<UUID, List<Share>> shares = shares(group);
+    return db.sql(
+            """
+        SELECT * FROM expense WHERE group_id=? AND deleted_at IS NULL AND (?::uuid IS NULL OR id=?::uuid)
+        ORDER BY incurred_on DESC, created_at DESC, id DESC
         """)
-            .params(group, offset)
-            .query(UUID.class)
-            .list();
-    return Groups.page(ids.stream().map(this::row).toList());
+        .params(group, only, only)
+        .query(
+            (r, n) -> {
+              UUID id = r.getObject("id", UUID.class);
+              return new Expense(
+                  id,
+                  r.getObject("payer_member_id", UUID.class),
+                  r.getString("description"),
+                  Category.valueOf(r.getString("category")),
+                  r.getLong("amount_minor"),
+                  SplitMethod.valueOf(r.getString("split_method")),
+                  r.getObject("incurred_on", LocalDate.class),
+                  r.getInt("version"),
+                  Groups.instant(r, "created_at"),
+                  shares.getOrDefault(id, List.of()));
+            })
+        .list();
   }
 
-  private Expense editable(UUID actor, UUID id, int version) {
-    Expense initial = row(id);
-    Member member = groups.membership(actor, initial.groupId());
-    if (!initial.createdBy().equals(actor) && !member.role().equals("OWNER"))
-      throw ApiException.missing();
-    groups.writable(initial.groupId());
-    Expense current = row(id);
-    if (current.version() != version) throw ApiException.conflict("STALE_VERSION");
-    if (current.voidedAt() != null) throw ApiException.conflict("EXPENSE_VOIDED");
-    return current;
+  public Expense expense(UUID group, UUID id) {
+    return expenses(group, id).stream().findFirst().orElseThrow(ApiException::missing);
   }
 
   @Transactional
-  public Expense edit(UUID actor, UUID id, ExpenseInput input) {
+  public Expense editExpense(UUID group, UUID actor, UUID id, ExpenseInput input) {
     if (input.version() == null) throw ApiException.invalid("VERSION_REQUIRED");
-    Expense before = editable(actor, id, input.version());
-    List<Share> shares = validate(actor, before.groupId(), input);
+    groups.lock(group);
+    Expense before = expense(group, id);
+    if (before.version() != input.version()) throw ApiException.conflict("STALE_VERSION");
+    List<Share> shares = validate(group, input);
     db.sql(
             """
-        UPDATE expense SET payer_member_id=?, description=?, amount_minor=?, split_method=?,
-          incurred_on=?, version=version+1 WHERE id=?
+        UPDATE expense SET payer_member_id=?, description=?, category=?, amount_minor=?,
+          split_method=?, incurred_on=?, version=version+1 WHERE id=? AND group_id=?
         """)
         .params(
             input.payerMemberId(),
-            input.description().strip(),
+            Groups.clean(input.description()),
+            input.category().name(),
             Money.cents(input.amount(), false),
             input.splitMethod().name(),
             input.incurredOn(),
-            id)
+            id,
+            group)
         .update();
-    saveShares(id, before.groupId(), shares);
-    Expense after = row(id);
-    groups.audit(
-        before.groupId(), actor, id, "EXPENSE_EDITED", "Before: " + before + "\nAfter: " + after);
+    saveShares(id, group, shares);
+    Expense after = expense(group, id);
+    groups.activity(group, actor, id, "EXPENSE_EDITED", before + " -> " + after);
     return after;
   }
 
   @Transactional
-  public Expense voidExpense(UUID actor, UUID id, int version) {
-    Expense before = editable(actor, id, version);
-    db.sql("UPDATE expense SET voided_at=now(), version=version+1 WHERE id=?").param(id).update();
-    Expense after = row(id);
-    groups.audit(
-        before.groupId(), actor, id, "EXPENSE_VOIDED", "Before: " + before + "\nAfter: " + after);
-    return after;
-  }
-
-  @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
-  public Balances balances(UUID actor, UUID group) {
-    groups.membership(actor, group);
-    List<Balance> balances =
-        db.sql(
-                """
-        WITH entries AS (
-          SELECT payer_member_id AS member_id, amount_minor FROM expense WHERE group_id=? AND voided_at IS NULL
-          UNION ALL SELECT s.member_id, -s.amount_minor FROM expense_share s JOIN expense e ON e.id=s.expense_id
-            WHERE e.group_id=? AND e.voided_at IS NULL
-          UNION ALL SELECT sender_member_id, amount_minor FROM settlement WHERE group_id=? AND status='CONFIRMED'
-          UNION ALL SELECT recipient_member_id, -amount_minor FROM settlement WHERE group_id=? AND status='CONFIRMED'
-        )
-        SELECT m.id, COALESCE(sum(e.amount_minor), 0)::bigint AS amount_minor FROM group_member m
-          LEFT JOIN entries e ON e.member_id=m.id WHERE m.group_id=? GROUP BY m.id ORDER BY m.id
-        """)
-            .params(group, group, group, group, group)
-            .query((r, n) -> new Balance(r.getObject("id", UUID.class), r.getLong("amount_minor")))
-            .list();
-    return new Balances(balances, Money.suggest(balances));
-  }
-
-  public Page<Settlement> settlements(UUID actor, UUID group, int offset) {
-    groups.membership(actor, group);
-    return Groups.page(
-        db.sql(
-                "SELECT * FROM settlement WHERE group_id=? ORDER BY created_at DESC, id DESC LIMIT 51 OFFSET ?")
-            .params(group, offset)
-            .query(SETTLEMENT)
-            .list());
-  }
-
-  private Settlement settlement(UUID id) {
-    return db.sql("SELECT * FROM settlement WHERE id=?")
-        .param(id)
-        .query(SETTLEMENT)
-        .optional()
-        .orElseThrow(ApiException::missing);
+  public void deleteExpense(UUID group, UUID actor, UUID id) {
+    groups.lock(group);
+    Expense before = expense(group, id);
+    db.sql("UPDATE expense SET deleted_at=now() WHERE id=? AND group_id=?")
+        .params(id, group)
+        .update();
+    groups.activity(group, actor, id, "EXPENSE_DELETED", before.toString());
   }
 
   @Transactional
-  public Settlement repay(UUID actor, UUID group, UUID key, SettlementInput input) {
-    Member sender = groups.membership(actor, group);
-    groups.writable(group);
-    UUID previous = retry(actor, key, "settlement:" + group, input.toString());
-    if (previous != null) return settlement(previous);
-    if (sender.id().equals(input.recipientMemberId())
-        || groups.members(actor, group).stream()
-            .noneMatch(m -> m.id().equals(input.recipientMemberId())))
-      throw ApiException.invalid("INVALID_RECIPIENT");
+  public Transfer createTransfer(UUID group, UUID actor, UUID key, TransferInput input) {
+    groups.lock(group);
+    UUID previous = retry(group, key, "CREATE_TRANSFER", input.toString());
+    if (previous != null) return transfer(group, previous);
+    if (input.fromMemberId().equals(input.toMemberId())) throw ApiException.invalid("SAME_MEMBER");
+    groups.member(group, input.fromMemberId());
+    groups.member(group, input.toMemberId());
+    checkDate(input.incurredOn());
     UUID id = UUID.randomUUID();
     db.sql(
             """
-        INSERT INTO settlement(id, group_id, sender_member_id, recipient_member_id, amount_minor, method)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO transfer(id, group_id, from_member_id, to_member_id, amount_minor, method, incurred_on)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """)
         .params(
             id,
             group,
-            sender.id(),
-            input.recipientMemberId(),
+            input.fromMemberId(),
+            input.toMemberId(),
             Money.cents(input.amount(), false),
-            input.method().name())
+            input.method().name(),
+            input.incurredOn())
         .update();
-    Settlement result = settlement(id);
-    groups.audit(group, actor, id, "SETTLEMENT_RECORDED", result.toString());
-    complete(actor, key, id);
+    Transfer result = transfer(group, id);
+    groups.activity(group, actor, id, "TRANSFER_ADDED", result.toString());
+    complete(group, key, id);
     return result;
   }
 
-  @Transactional
-  public Settlement transition(UUID actor, UUID id, String action) {
-    Settlement initial = settlement(id);
-    Member member = groups.membership(actor, initial.groupId());
-    String target =
-        switch (action) {
-          case "confirm" -> "CONFIRMED";
-          case "reject" -> "REJECTED";
-          case "cancel" -> "CANCELLED";
-          default -> throw ApiException.missing();
-        };
-    UUID permitted =
-        target.equals("CANCELLED") ? initial.senderMemberId() : initial.recipientMemberId();
-    if (!member.id().equals(permitted)) throw ApiException.missing();
-    groups.writable(initial.groupId());
-    Settlement current =
-        db.sql("SELECT * FROM settlement WHERE id=? FOR UPDATE")
-            .param(id)
-            .query(SETTLEMENT)
-            .single();
-    if (current.status().equals(target)) return current;
-    if (!current.status().equals("PENDING")) throw ApiException.conflict("SETTLEMENT_FINAL");
-    db.sql(
+  private List<Transfer> transfers(UUID group, UUID only) {
+    return db.sql(
             """
-        UPDATE settlement SET status=?, version=version+1,
-          confirmed_at=CASE WHEN ?='CONFIRMED' THEN now() ELSE NULL END WHERE id=?
+        SELECT * FROM transfer WHERE group_id=? AND deleted_at IS NULL AND (?::uuid IS NULL OR id=?::uuid)
+        ORDER BY incurred_on DESC, created_at DESC, id DESC
         """)
-        .params(target, target, id)
+        .params(group, only, only)
+        .query(
+            (r, n) ->
+                new Transfer(
+                    r.getObject("id", UUID.class),
+                    r.getObject("from_member_id", UUID.class),
+                    r.getObject("to_member_id", UUID.class),
+                    r.getLong("amount_minor"),
+                    PaymentMethod.valueOf(r.getString("method")),
+                    r.getObject("incurred_on", LocalDate.class),
+                    Groups.instant(r, "created_at")))
+        .list();
+  }
+
+  public Transfer transfer(UUID group, UUID id) {
+    return transfers(group, id).stream().findFirst().orElseThrow(ApiException::missing);
+  }
+
+  @Transactional
+  public void deleteTransfer(UUID group, UUID actor, UUID id) {
+    groups.lock(group);
+    Transfer before = transfer(group, id);
+    db.sql("UPDATE transfer SET deleted_at=now() WHERE id=? AND group_id=?")
+        .params(id, group)
         .update();
-    Settlement result = settlement(id);
-    groups.audit(
-        current.groupId(),
-        actor,
-        id,
-        "SETTLEMENT_" + target,
-        "Before: " + current + "\nAfter: " + result);
-    return result;
+    groups.activity(group, actor, id, "TRANSFER_DELETED", before.toString());
+  }
+
+  /**
+   * Balance = paid − own share + transfers sent − transfers received; positive means owed money.
+   */
+  @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+  public Snapshot snapshot(String code) {
+    Group group = groups.read(code);
+    UUID id = group.id();
+    List<Member> members = groups.members(id);
+    List<Expense> expenses = expenses(id, null);
+    List<Transfer> transfers = transfers(id, null);
+    Map<UUID, long[]> totals = new LinkedHashMap<>();
+    for (Member m : members) totals.put(m.id(), new long[3]);
+    for (Expense e : expenses) {
+      totals.get(e.payerMemberId())[1] += e.amountMinor();
+      for (Share s : e.shares()) totals.get(s.memberId())[2] += s.amountMinor();
+    }
+    for (Transfer t : transfers) {
+      totals.get(t.fromMemberId())[0] += t.amountMinor();
+      totals.get(t.toMemberId())[0] -= t.amountMinor();
+    }
+    List<Balance> balances = new ArrayList<>();
+    totals.forEach(
+        (member, t) -> balances.add(new Balance(member, t[0] + t[1] - t[2], t[1], t[2])));
+    return new Snapshot(group, members, expenses, transfers, balances, Money.suggest(balances));
   }
 }

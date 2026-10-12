@@ -9,25 +9,17 @@ import java.security.SecureRandom;
 import java.sql.*;
 import java.time.*;
 import java.util.*;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+/** Groups are keyed by a secret link code; whoever holds the link is a full participant. */
 @Service
 public class Groups {
-  static final RowMapper<Group> GROUP =
-      (r, n) ->
-          new Group(
-              r.getObject("id", UUID.class),
-              r.getString("name"),
-              r.getString("currency"),
-              instant(r, "archived_at"));
   static final RowMapper<Member> MEMBER =
-      (r, n) ->
-          new Member(
-              r.getObject("id", UUID.class), r.getObject("user_id", UUID.class),
-              r.getString("display_name"), r.getString("role"));
+      (r, n) -> new Member(r.getObject("id", UUID.class), r.getString("name"));
   private final JdbcClient db;
   private final SecureRandom random = new SecureRandom();
 
@@ -50,211 +42,168 @@ public class Groups {
     }
   }
 
-  @Transactional
-  public User profile(UUID userId, Profile input) {
-    db.sql(
-            """
-        INSERT INTO app_user(id, display_name) VALUES (?, ?)
-        ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name
-        """)
-        .params(userId, input.displayName().strip())
-        .update();
-    return user(userId);
+  static String clean(String name) {
+    String value = name.strip().replaceAll("\\s+", " ");
+    if (value.isEmpty()) throw ApiException.invalid("INVALID_INPUT");
+    return value;
   }
 
-  public User user(UUID userId) {
-    return db.sql("SELECT id, display_name FROM app_user WHERE id=?")
-        .param(userId)
-        .query((r, n) -> new User(r.getObject("id", UUID.class), r.getString("display_name")))
-        .optional()
-        .orElseThrow(() -> ApiException.invalid("PROFILE_REQUIRED"));
-  }
-
-  public List<Group> list(UUID actor) {
-    return db.sql(
-            """
-        SELECT g.* FROM split_group g JOIN group_member m ON m.group_id=g.id
-        WHERE m.user_id=? AND m.inactive_at IS NULL ORDER BY g.created_at DESC, g.id
-        """)
-        .param(actor)
-        .query(GROUP)
-        .list();
+  private static String emoji(String value) {
+    return value == null || value.isBlank() ? "🐻" : value.strip();
   }
 
   @Transactional
-  public Group create(UUID actor, GroupInput input) {
-    user(actor);
-    UUID id = UUID.randomUUID();
-    db.sql("INSERT INTO split_group(id, name) VALUES (?, ?)")
-        .params(id, input.name().strip())
-        .update();
-    db.sql("INSERT INTO group_member(id, group_id, user_id, role) VALUES (?, ?, ?, 'OWNER')")
-        .params(UUID.randomUUID(), id, actor)
-        .update();
-    audit(id, actor, id, "GROUP_CREATED", input.name().strip());
-    return get(actor, id);
-  }
-
-  public Group get(UUID actor, UUID group) {
-    membership(actor, group);
-    return db.sql("SELECT * FROM split_group WHERE id=?")
-        .param(group)
-        .query(GROUP)
-        .optional()
-        .orElseThrow(ApiException::missing);
-  }
-
-  public Member membership(UUID actor, UUID group) {
-    return db.sql(
-            """
-        SELECT m.*, u.display_name FROM group_member m JOIN app_user u ON u.id=m.user_id
-        WHERE m.group_id=? AND m.user_id=? AND m.inactive_at IS NULL
-        """)
-        .params(group, actor)
-        .query(MEMBER)
-        .optional()
-        .orElseThrow(ApiException::missing);
-  }
-
-  public Member owner(UUID actor, UUID group) {
-    Member m = membership(actor, group);
-    if (!m.role().equals("OWNER")) throw ApiException.missing();
-    return m;
-  }
-
-  public List<Member> members(UUID actor, UUID group) {
-    membership(actor, group);
-    return db.sql(
-            """
-        SELECT m.*, u.display_name FROM group_member m JOIN app_user u ON u.id=m.user_id
-        WHERE m.group_id=? AND m.inactive_at IS NULL ORDER BY m.id
-        """)
-        .param(group)
-        .query(MEMBER)
-        .list();
-  }
-
-  public void writable(UUID group) {
-    Group g =
-        db.sql("SELECT * FROM split_group WHERE id=? FOR UPDATE")
-            .param(group)
-            .query(GROUP)
-            .optional()
-            .orElseThrow(ApiException::missing);
-    if (g.archivedAt() != null) throw ApiException.conflict("GROUP_ARCHIVED");
-  }
-
-  @Transactional
-  public Invite invite(UUID actor, UUID group) {
-    owner(actor, group);
-    writable(group);
-    byte[] bytes = new byte[32];
+  public Group create(GroupInput input) {
+    byte[] bytes = new byte[20];
     random.nextBytes(bytes);
-    String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    String code = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     UUID id = UUID.randomUUID();
-    Instant expires = Instant.now().plus(Duration.ofDays(7));
-    db.sql("INSERT INTO invitation(id, group_id, token_hash, expires_at) VALUES (?, ?, ?, ?)")
-        .params(id, group, hash(token), Timestamp.from(expires))
+    db.sql("INSERT INTO split_group(id, code_hash, name, emoji) VALUES (?, ?, ?, ?)")
+        .params(id, hash(code), clean(input.name()), emoji(input.emoji()))
         .update();
-    audit(group, actor, id, "INVITATION_CREATED", "Expires " + expires);
-    return new Invite(id, token, expires);
+    LinkedHashSet<String> names = new LinkedHashSet<>();
+    for (String name : input.members()) names.add(clean(name));
+    for (String name : names) insertMember(id, name);
+    activity(id, null, id, "GROUP_CREATED", input.name());
+    return group(id, code);
   }
 
-  public List<InviteSummary> invitations(UUID actor, UUID group) {
-    owner(actor, group);
-    return db.sql("SELECT * FROM invitation WHERE group_id=? ORDER BY expires_at DESC LIMIT 100")
-        .param(group)
+  private Member insertMember(UUID group, String name) {
+    UUID id = UUID.randomUUID();
+    try {
+      db.sql(
+              """
+              INSERT INTO member(id, group_id, name, position)
+              SELECT ?, ?, ?, COALESCE(MAX(position), 0) + 1 FROM member WHERE group_id=?
+              """)
+          .params(id, group, name, group)
+          .update();
+    } catch (DuplicateKeyException e) {
+      throw ApiException.conflict("DUPLICATE_MEMBER");
+    }
+    return new Member(id, name);
+  }
+
+  private Group group(UUID id, String code) {
+    return db.sql("SELECT id, name, emoji, currency FROM split_group WHERE id=?")
+        .param(id)
         .query(
             (r, n) ->
-                new InviteSummary(
+                new Group(
                     r.getObject("id", UUID.class),
-                    instant(r, "expires_at"),
-                    instant(r, "redeemed_at"),
-                    instant(r, "revoked_at")))
+                    code,
+                    r.getString("name"),
+                    r.getString("emoji"),
+                    r.getString("currency")))
+        .optional()
+        .orElseThrow(ApiException::missing);
+  }
+
+  /**
+   * Resolves a link code to the group id. Unknown codes are indistinguishable from missing groups.
+   */
+  public UUID resolve(String code) {
+    if (code == null || !code.matches("[A-Za-z0-9_-]{20,64}")) throw ApiException.missing();
+    return db.sql("SELECT id FROM split_group WHERE code_hash=?")
+        .param(hash(code))
+        .query(UUID.class)
+        .optional()
+        .orElseThrow(ApiException::missing);
+  }
+
+  /** Serializes writes within one group so balance-affecting changes never interleave. */
+  void lock(UUID group) {
+    db.sql("SELECT id FROM split_group WHERE id=? FOR UPDATE")
+        .param(group)
+        .query(UUID.class)
+        .optional()
+        .orElseThrow(ApiException::missing);
+    db.sql("UPDATE split_group SET updated_at=now() WHERE id=?").param(group).update();
+  }
+
+  public Group read(String code) {
+    return group(resolve(code), code);
+  }
+
+  @Transactional
+  public Group rename(String code, GroupPatch input) {
+    UUID id = resolve(code);
+    lock(id);
+    db.sql("UPDATE split_group SET name=?, emoji=? WHERE id=?")
+        .params(clean(input.name()), emoji(input.emoji()), id)
+        .update();
+    activity(id, null, id, "GROUP_RENAMED", input.name());
+    return group(id, code);
+  }
+
+  public List<Member> members(UUID group) {
+    return db.sql("SELECT id, name FROM member WHERE group_id=? ORDER BY position")
+        .param(group)
+        .query(MEMBER)
         .list();
   }
 
-  @Transactional
-  public void revoke(UUID actor, UUID group, UUID id) {
-    owner(actor, group);
-    int updated =
-        db.sql("UPDATE invitation SET revoked_at=now() WHERE id=? AND group_id=?")
-            .params(id, group)
-            .update();
-    if (updated == 0) throw ApiException.missing();
-    audit(group, actor, id, "INVITATION_REVOKED", "Revoked");
+  Member member(UUID group, UUID id) {
+    return db.sql("SELECT id, name FROM member WHERE group_id=? AND id=?")
+        .params(group, id)
+        .query(MEMBER)
+        .optional()
+        .orElseThrow(() -> ApiException.invalid("UNKNOWN_MEMBER"));
   }
 
-  private record InvitationRow(
-      UUID id, UUID group, Instant expires, Instant redeemed, UUID redeemedBy, Instant revoked) {}
+  @Transactional
+  public Member addMember(UUID group, UUID actor, MemberInput input) {
+    lock(group);
+    if (members(group).size() >= 50) throw ApiException.invalid("TOO_MANY_MEMBERS");
+    Member member = insertMember(group, clean(input.name()));
+    activity(group, actor, member.id(), "MEMBER_ADDED", member.name());
+    return member;
+  }
 
   @Transactional
-  public Group accept(UUID actor, String token) {
-    user(actor);
-    InvitationRow i =
-        db.sql("SELECT * FROM invitation WHERE token_hash=? FOR UPDATE")
-            .param(hash(token))
-            .query(
-                (r, n) ->
-                    new InvitationRow(
-                        r.getObject("id", UUID.class),
-                        r.getObject("group_id", UUID.class),
-                        instant(r, "expires_at"),
-                        instant(r, "redeemed_at"),
-                        r.getObject("redeemed_by", UUID.class),
-                        instant(r, "revoked_at")))
-            .optional()
-            .orElseThrow(() -> ApiException.invalid("INVITE_INVALID"));
-    if (i.revoked() != null || i.expires().isBefore(Instant.now()))
-      throw ApiException.invalid("INVITE_INVALID");
-    if (i.redeemed() != null) {
-      if (actor.equals(i.redeemedBy())) return get(actor, i.group());
-      throw ApiException.conflict("INVITE_USED");
+  public Member renameMember(UUID group, UUID actor, UUID id, MemberInput input) {
+    lock(group);
+    member(group, id);
+    String name = clean(input.name());
+    try {
+      db.sql("UPDATE member SET name=? WHERE id=? AND group_id=?").params(name, id, group).update();
+    } catch (DuplicateKeyException e) {
+      throw ApiException.conflict("DUPLICATE_MEMBER");
     }
-    writable(i.group());
+    activity(group, actor, id, "MEMBER_RENAMED", name);
+    return new Member(id, name);
+  }
+
+  void activity(UUID group, UUID actor, UUID entity, String action, String detail) {
     db.sql(
             """
-        INSERT INTO group_member(id, group_id, user_id, role) VALUES (?, ?, ?, 'MEMBER')
-        ON CONFLICT(group_id, user_id) DO NOTHING
+        INSERT INTO activity(id, group_id, actor_member_id, entity_id, action, detail)
+        VALUES (?, ?, ?, ?, ?, ?)
         """)
-        .params(UUID.randomUUID(), i.group(), actor)
+        .params(UUID.randomUUID(), group, actor, entity, action, detail)
         .update();
-    db.sql("UPDATE invitation SET redeemed_at=now(), redeemed_by=? WHERE id=?")
-        .params(actor, i.id())
-        .update();
-    audit(i.group(), actor, i.id(), "MEMBER_JOINED", "Joined group");
-    return get(actor, i.group());
   }
 
-  public Page<Audit> history(UUID actor, UUID group, int offset) {
-    membership(actor, group);
-    List<Audit> rows =
+  public Page<Activity> activity(UUID group, int offset) {
+    return page(
         db.sql(
                 """
-        SELECT * FROM audit_event WHERE group_id=? ORDER BY created_at DESC, id DESC LIMIT 51 OFFSET ?
+        SELECT * FROM activity WHERE group_id=? ORDER BY created_at DESC, id DESC LIMIT 51 OFFSET ?
         """)
             .params(group, offset)
             .query(
                 (r, n) ->
-                    new Audit(
+                    new Activity(
                         r.getObject("id", UUID.class),
-                        r.getObject("actor_id", UUID.class),
+                        r.getObject("actor_member_id", UUID.class),
                         r.getObject("entity_id", UUID.class),
                         r.getString("action"),
                         r.getString("detail"),
                         instant(r, "created_at")))
-            .list();
-    return page(rows);
+            .list());
   }
 
   static <T> Page<T> page(List<T> rows) {
-    return new Page<>(rows.subList(0, Math.min(50, rows.size())), rows.size() > 50);
-  }
-
-  void audit(UUID group, UUID actor, UUID entity, String action, String detail) {
-    db.sql(
-            "INSERT INTO audit_event(id, group_id, actor_id, entity_id, action, detail) VALUES (?, ?, ?, ?, ?, ?)")
-        .params(UUID.randomUUID(), group, actor, entity, action, detail)
-        .update();
+    return new Page<>(rows.size() > 50 ? rows.subList(0, 50) : rows, rows.size() > 50);
   }
 }

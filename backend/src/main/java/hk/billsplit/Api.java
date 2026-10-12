@@ -21,21 +21,34 @@ public final class Api {
     CASH
   }
 
-  public record Profile(@NotBlank @Size(max = 60) String displayName) {}
+  public enum Category {
+    FOOD,
+    TRANSPORT,
+    STAY,
+    SHOPPING,
+    FUN,
+    OTHER
+  }
 
-  public record User(UUID id, String displayName) {}
+  public record GroupInput(
+      @NotBlank @Size(max = 80) String name,
+      @Size(max = 8) String emoji,
+      @NotEmpty @Size(max = 50) List<@NotBlank @Size(max = 40) String> members) {}
 
-  public record GroupInput(@NotBlank @Size(max = 80) String name) {}
+  public record GroupPatch(@NotBlank @Size(max = 80) String name, @Size(max = 8) String emoji) {}
 
-  public record Group(UUID id, String name, String currency, Instant archivedAt) {}
+  public record MemberInput(@NotBlank @Size(max = 40) String name) {}
 
-  public record Member(UUID id, UUID userId, String displayName, String role) {}
+  public record Group(UUID id, String code, String name, String emoji, String currency) {}
+
+  public record Member(UUID id, String name) {}
 
   public record Participant(@NotNull UUID memberId, @Size(max = 30) String value) {}
 
   public record ExpenseInput(
       @NotNull UUID payerMemberId,
       @NotBlank @Size(max = 160) String description,
+      @NotNull Category category,
       @NotBlank @Size(max = 30) String amount,
       @NotNull SplitMethod splitMethod,
       @NotNull LocalDate incurredOn,
@@ -46,50 +59,51 @@ public final class Api {
 
   public record Expense(
       UUID id,
-      UUID groupId,
       UUID payerMemberId,
-      UUID createdBy,
       String description,
+      Category category,
       long amountMinor,
       SplitMethod splitMethod,
       LocalDate incurredOn,
       int version,
-      Instant voidedAt,
+      Instant createdAt,
       List<Share> shares) {}
 
-  public record Version(@PositiveOrZero int version) {}
+  public record TransferInput(
+      @NotNull UUID fromMemberId,
+      @NotNull UUID toMemberId,
+      @NotBlank @Size(max = 30) String amount,
+      @NotNull PaymentMethod method,
+      @NotNull LocalDate incurredOn) {}
 
-  public record Balance(UUID memberId, long amountMinor) {}
+  public record Transfer(
+      UUID id,
+      UUID fromMemberId,
+      UUID toMemberId,
+      long amountMinor,
+      PaymentMethod method,
+      LocalDate incurredOn,
+      Instant createdAt) {}
+
+  public record Balance(UUID memberId, long amountMinor, long paidMinor, long shareMinor) {}
 
   public record Suggestion(UUID senderMemberId, UUID recipientMemberId, long amountMinor) {}
 
-  public record Balances(List<Balance> balances, List<Suggestion> suggestions) {}
+  public record Snapshot(
+      Group group,
+      List<Member> members,
+      List<Expense> expenses,
+      List<Transfer> transfers,
+      List<Balance> balances,
+      List<Suggestion> suggestions) {}
 
-  public record SettlementInput(
-      @NotNull UUID recipientMemberId,
-      @NotBlank @Size(max = 30) String amount,
-      @NotNull PaymentMethod method) {}
-
-  public record Settlement(
+  public record Activity(
       UUID id,
-      UUID groupId,
-      UUID senderMemberId,
-      UUID recipientMemberId,
-      long amountMinor,
-      PaymentMethod method,
-      String status,
-      int version,
-      Instant createdAt,
-      Instant confirmedAt) {}
-
-  public record Invite(UUID id, String token, Instant expiresAt) {}
-
-  public record InviteSummary(UUID id, Instant expiresAt, Instant redeemedAt, Instant revokedAt) {}
-
-  public record AcceptInvite(@NotBlank @Size(max = 100) String token) {}
-
-  public record Audit(
-      UUID id, UUID actorId, UUID entityId, String action, String detail, Instant createdAt) {}
+      UUID actorMemberId,
+      UUID entityId,
+      String action,
+      String detail,
+      Instant createdAt) {}
 
   public record Page<T>(List<T> items, boolean hasMore) {}
 }

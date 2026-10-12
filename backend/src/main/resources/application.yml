@@ -17,10 +17,3 @@ spring:
   mvc:
     problemdetails:
       enabled: false
-app:
-  auth:
-    issuer: ${SUPABASE_URL:}/auth/v1
-    jwk-set-uri: ${SUPABASE_URL:}/auth/v1/.well-known/jwks.json
-    audience: authenticated
-  supabase-url: ${SUPABASE_URL:}
-  supabase-publishable-key: ${SUPABASE_PUBLISHABLE_KEY:}

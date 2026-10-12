@@ -2,7 +2,6 @@ package hk.billsplit;
 
 import static hk.billsplit.Api.*;
 import static org.assertj.core.api.Assertions.*;
-import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -13,6 +12,7 @@ import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -21,11 +21,7 @@ import org.testcontainers.junit.jupiter.*;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
 
-@SpringBootTest(
-    properties = {
-      "app.auth.issuer=https://auth.example.test/auth/v1",
-      "app.auth.jwk-set-uri=https://auth.example.test/auth/v1/.well-known/jwks.json"
-    })
+@SpringBootTest
 @AutoConfigureMockMvc
 @Testcontainers
 class LedgerIntegrationTest {
@@ -38,40 +34,35 @@ class LedgerIntegrationTest {
     r.add("spring.datasource.password", POSTGRES::getPassword);
   }
 
+  private static final LocalDate DAY = LocalDate.of(2026, 1, 1);
   @Autowired Groups groups;
   @Autowired Ledger ledger;
   @Autowired JdbcClient db;
   @Autowired MockMvc mvc;
   @Autowired ObjectMapper json;
-  private UUID alice, bob, carol, outsider, group;
+  private Group group;
+  private UUID id;
   private Member a, b, c;
 
   @BeforeEach
   void setup() {
-    db.sql("TRUNCATE app_user, split_group CASCADE").update();
-    alice = UUID.randomUUID();
-    bob = UUID.randomUUID();
-    carol = UUID.randomUUID();
-    outsider = UUID.randomUUID();
-    groups.profile(alice, new Profile("Alice"));
-    groups.profile(bob, new Profile("Bob"));
-    groups.profile(carol, new Profile("Carol"));
-    groups.profile(outsider, new Profile("Outsider"));
-    group = groups.create(alice, new GroupInput("Dinner")).id();
-    groups.accept(bob, groups.invite(alice, group).token());
-    groups.accept(carol, groups.invite(alice, group).token());
-    a = groups.membership(alice, group);
-    b = groups.membership(bob, group);
-    c = groups.membership(carol, group);
+    db.sql("TRUNCATE split_group CASCADE").update();
+    group = groups.create(new GroupInput("Dinner", null, List.of("Alice", "Bob", "Carol")));
+    id = group.id();
+    List<Member> members = groups.members(id);
+    a = members.get(0);
+    b = members.get(1);
+    c = members.get(2);
   }
 
   private ExpenseInput dinner(String amount, Integer version) {
     return new ExpenseInput(
         a.id(),
         "Dinner",
+        Category.FOOD,
         amount,
         SplitMethod.EQUAL,
-        LocalDate.of(2026, 1, 1),
+        DAY,
         List.of(
             new Participant(a.id(), null),
             new Participant(b.id(), null),
@@ -80,350 +71,256 @@ class LedgerIntegrationTest {
   }
 
   private long balance(UUID member) {
-    return ledger.balances(alice, group).balances().stream()
+    return ledger.snapshot(group.code()).balances().stream()
         .filter(x -> x.memberId().equals(member))
-        .findFirst()
-        .orElseThrow()
-        .amountMinor();
+        .mapToLong(Balance::amountMinor)
+        .sum();
   }
 
   @Test
-  void completeDinnerAndConfirmedRepaymentsSettleToZero() {
-    ledger.createExpense(alice, group, UUID.randomUUID(), dinner("1500.00", null));
-    assertThat(balance(a.id())).isEqualTo(100000);
-    assertThat(balance(b.id())).isEqualTo(-50000);
-    Settlement payment =
-        ledger.repay(
-            bob,
-            group,
+  void linkCodeIsTheOnlyCredentialAndUnknownCodesAreNotFound() throws Exception {
+    assertThat(group.code()).matches("[A-Za-z0-9_-]{27}");
+    assertThat(db.sql("SELECT code_hash FROM split_group").query(String.class).single())
+        .isNotEqualTo(group.code());
+    mvc.perform(get("/api/v1/g/" + group.code())).andExpect(status().isOk());
+    mvc.perform(get("/api/v1/g/" + group.code().substring(0, 26) + "x"))
+        .andExpect(status().isNotFound());
+    mvc.perform(get("/api/v1/g/short")).andExpect(status().isNotFound());
+    mvc.perform(get("/g/" + group.code())).andExpect(forwardedUrl("/index.html"));
+  }
+
+  @Test
+  void expensesAndTransfersSettleToZero() {
+    ledger.createExpense(id, a.id(), UUID.randomUUID(), dinner("90.00", null));
+    assertThat(balance(a.id())).isEqualTo(6000);
+    assertThat(balance(b.id())).isEqualTo(-3000);
+    assertThat(balance(c.id())).isEqualTo(-3000);
+    Snapshot snapshot = ledger.snapshot(group.code());
+    assertThat(snapshot.suggestions())
+        .containsExactlyInAnyOrder(
+            new Suggestion(b.id(), a.id(), 3000), new Suggestion(c.id(), a.id(), 3000));
+    ledger.createTransfer(
+        id,
+        b.id(),
+        UUID.randomUUID(),
+        new TransferInput(b.id(), a.id(), "30.00", PaymentMethod.FPS, DAY));
+    Transfer carol =
+        ledger.createTransfer(
+            id,
+            c.id(),
             UUID.randomUUID(),
-            new SettlementInput(a.id(), "500.00", PaymentMethod.FPS));
-    assertThat(balance(b.id())).isEqualTo(-50000);
-    assertThatThrownBy(() -> ledger.transition(bob, payment.id(), "confirm"))
-        .isInstanceOf(ApiException.class);
-    ledger.transition(alice, payment.id(), "confirm");
-    ledger.transition(alice, payment.id(), "confirm");
+            new TransferInput(c.id(), a.id(), "30.00", PaymentMethod.PAYME, DAY));
+    assertThat(balance(a.id())).isZero();
     assertThat(balance(b.id())).isZero();
-    Settlement last =
-        ledger.repay(
-            carol,
-            group,
-            UUID.randomUUID(),
-            new SettlementInput(a.id(), "500.00", PaymentMethod.PAYME));
-    ledger.transition(alice, last.id(), "confirm");
-    assertThat(ledger.balances(alice, group).balances()).allMatch(x -> x.amountMinor() == 0);
-    assertThat(ledger.balances(alice, group).suggestions()).isEmpty();
-    assertThat(
-            db.sql("SELECT count(*) FROM audit_event WHERE action='SETTLEMENT_CONFIRMED'")
-                .query(Long.class)
-                .single())
-        .isEqualTo(2);
+    assertThat(ledger.snapshot(group.code()).suggestions()).isEmpty();
+    ledger.deleteTransfer(id, c.id(), carol.id());
+    assertThat(balance(c.id())).isEqualTo(-3000);
+    assertThat(balance(a.id())).isEqualTo(3000);
   }
 
   @Test
   void retriesReturnOneRecordAndChangedPayloadConflicts() {
     UUID key = UUID.randomUUID();
-    Expense first = ledger.createExpense(alice, group, key, dinner("30", null));
-    assertThat(ledger.createExpense(alice, group, key, dinner("30", null)).id())
-        .isEqualTo(first.id());
-    assertThatThrownBy(() -> ledger.createExpense(alice, group, key, dinner("31", null)))
-        .isInstanceOf(ApiException.class)
-        .hasMessage("IDEMPOTENCY_CONFLICT");
-    assertThat(ledger.expenses(alice, group, 0).items()).hasSize(1);
-    UUID repaymentKey = UUID.randomUUID();
-    SettlementInput payment = new SettlementInput(a.id(), "10", PaymentMethod.CASH);
-    Settlement repayment = ledger.repay(bob, group, repaymentKey, payment);
-    assertThat(ledger.repay(bob, group, repaymentKey, payment).id()).isEqualTo(repayment.id());
-    assertThat(ledger.settlements(alice, group, 0).items()).hasSize(1);
+    Expense first = ledger.createExpense(id, a.id(), key, dinner("90.00", null));
+    Expense second = ledger.createExpense(id, a.id(), key, dinner("90.00", null));
+    assertThat(second.id()).isEqualTo(first.id());
+    assertThat(ledger.snapshot(group.code()).expenses()).hasSize(1);
+    assertThatThrownBy(() -> ledger.createExpense(id, a.id(), key, dinner("91.00", null)))
+        .hasMessage("IDEMPOTENCY_MISMATCH");
   }
 
   @Test
-  void invalidSharesRollBackExpenseAuditAndIdempotency() {
-    ExpenseInput invalid =
-        new ExpenseInput(
-            a.id(),
-            "Bad total",
-            "10",
-            SplitMethod.EXACT,
-            LocalDate.of(2026, 1, 1),
-            List.of(new Participant(a.id(), "9.99")),
-            null);
-    assertThatThrownBy(() -> ledger.createExpense(alice, group, UUID.randomUUID(), invalid))
-        .isInstanceOf(ApiException.class);
-    assertThat(db.sql("SELECT count(*) FROM expense").query(Long.class).single()).isZero();
-    assertThat(db.sql("SELECT count(*) FROM idempotency").query(Long.class).single()).isZero();
-    assertThat(
-            db.sql("SELECT count(*) FROM audit_event WHERE action='EXPENSE_CREATED'")
-                .query(Long.class)
-                .single())
-        .isZero();
-  }
-
-  @Test
-  void editsRejectStaleVersionsAndVoidsKeepConfirmedRepayments() {
-    Expense expense = ledger.createExpense(alice, group, UUID.randomUUID(), dinner("30", null));
-    assertThatThrownBy(() -> ledger.edit(bob, expense.id(), dinner("60", 0)))
-        .isInstanceOf(ApiException.class);
-    Expense edited = ledger.edit(alice, expense.id(), dinner("60", 0));
-    assertThat(edited.version()).isEqualTo(1);
-    assertThat(balance(b.id())).isEqualTo(-2000);
-    assertThatThrownBy(() -> ledger.edit(alice, expense.id(), dinner("90", 0)))
-        .hasMessage("STALE_VERSION");
-    Settlement payment =
-        ledger.repay(
-            bob, group, UUID.randomUUID(), new SettlementInput(a.id(), "20", PaymentMethod.FPS));
-    ledger.transition(alice, payment.id(), "confirm");
-    ledger.voidExpense(alice, expense.id(), 1);
-    assertThat(balance(b.id())).isEqualTo(2000);
-    assertThat(balance(a.id())).isEqualTo(-2000);
-    assertThat(ledger.expense(alice, expense.id()).voidedAt()).isNotNull();
-    assertThat(groups.history(alice, group, 0).items())
-        .anyMatch(
-            x ->
-                x.action().equals("EXPENSE_EDITED")
-                    && x.detail().contains("Before:")
-                    && x.detail().contains("After:"));
-  }
-
-  @Test
-  void rejectedCancelledAndOverpaidRepaymentsHaveExplicitEffects() {
-    ledger.createExpense(alice, group, UUID.randomUUID(), dinner("30", null));
-    Settlement rejected =
-        ledger.repay(
-            bob, group, UUID.randomUUID(), new SettlementInput(a.id(), "10", PaymentMethod.CASH));
-    ledger.transition(alice, rejected.id(), "reject");
-    assertThatThrownBy(() -> ledger.transition(alice, rejected.id(), "confirm"))
-        .hasMessage("SETTLEMENT_FINAL");
-    Settlement cancelled =
-        ledger.repay(
-            bob, group, UUID.randomUUID(), new SettlementInput(a.id(), "10", PaymentMethod.CASH));
-    ledger.transition(bob, cancelled.id(), "cancel");
-    assertThat(balance(b.id())).isEqualTo(-1000);
-    Settlement overpaid =
-        ledger.repay(
-            bob, group, UUID.randomUUID(), new SettlementInput(a.id(), "20", PaymentMethod.CASH));
-    ledger.transition(alice, overpaid.id(), "confirm");
-    assertThat(balance(b.id())).isEqualTo(1000);
-    assertThat(
-            ledger.balances(alice, group).balances().stream().mapToLong(Balance::amountMinor).sum())
-        .isZero();
-  }
-
-  @Test
-  void crossGroupAccessAndParticipantsAreRejected() throws Exception {
-    Expense expense = ledger.createExpense(alice, group, UUID.randomUUID(), dinner("30", null));
-    for (String path :
-        List.of(
-            "/groups/" + group,
-            "/groups/" + group + "/members",
-            "/groups/" + group + "/expenses",
-            "/groups/" + group + "/balances",
-            "/groups/" + group + "/settlements",
-            "/groups/" + group + "/audit",
-            "/expenses/" + expense.id())) {
-      mvc.perform(get("/api/v1" + path).with(jwt().jwt(j -> j.subject(outsider.toString()))))
-          .andExpect(status().isNotFound());
-    }
-    UUID foreignGroup = groups.create(outsider, new GroupInput("Other")).id();
-    Member foreign = groups.membership(outsider, foreignGroup);
-    ExpenseInput invalid =
-        new ExpenseInput(
-            a.id(),
-            "Cross group",
-            "10",
-            SplitMethod.EQUAL,
-            LocalDate.of(2026, 1, 1),
-            List.of(new Participant(foreign.id(), null)),
-            null);
-    assertThatThrownBy(() -> ledger.createExpense(alice, group, UUID.randomUUID(), invalid))
-        .hasMessage("INVALID_MEMBER");
-    assertThatThrownBy(() -> groups.invite(bob, group)).isInstanceOf(ApiException.class);
-  }
-
-  @Test
-  void inviteHashExpirationRevocationAndSingleUseAreEnforced() {
-    Invite i = groups.invite(alice, group);
-    assertThat(
-            db.sql("SELECT token_hash FROM invitation WHERE id=?")
-                .param(i.id())
-                .query(String.class)
-                .single())
-        .isNotEqualTo(i.token())
-        .hasSize(64);
-    groups.accept(outsider, i.token());
-    groups.accept(outsider, i.token());
-    assertThatThrownBy(() -> groups.accept(bob, i.token())).hasMessage("INVITE_USED");
-    Invite expired = groups.invite(alice, group);
-    db.sql("UPDATE invitation SET expires_at=now()-interval '1 day' WHERE id=?")
-        .param(expired.id())
-        .update();
-    assertThatThrownBy(() -> groups.accept(outsider, expired.token())).hasMessage("INVITE_INVALID");
-    Invite revoked = groups.invite(alice, group);
-    groups.revoke(alice, group, revoked.id());
-    assertThatThrownBy(() -> groups.accept(outsider, revoked.token())).hasMessage("INVITE_INVALID");
-  }
-
-  private <T> List<T> concurrent(Callable<T> first, Callable<T> second) throws Exception {
-    CyclicBarrier barrier = new CyclicBarrier(2);
-    try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-      Future<T> a =
-          executor.submit(
-              () -> {
-                barrier.await(10, TimeUnit.SECONDS);
-                return first.call();
-              });
-      Future<T> b =
-          executor.submit(
-              () -> {
-                barrier.await(10, TimeUnit.SECONDS);
-                return second.call();
-              });
-      return List.of(a.get(30, TimeUnit.SECONDS), b.get(30, TimeUnit.SECONDS));
-    }
-  }
-
-  @Test
-  void concurrentConfirmationsAndDuplicateCreatesApplyOnce() throws Exception {
+  void invalidInputRollsBackEverythingIncludingIdempotency() {
     UUID key = UUID.randomUUID();
-    List<Expense> expenses =
-        concurrent(
-            () -> ledger.createExpense(alice, group, key, dinner("30", null)),
-            () -> ledger.createExpense(alice, group, key, dinner("30", null)));
-    assertThat(expenses.getFirst().id()).isEqualTo(expenses.getLast().id());
-    Settlement payment =
-        ledger.repay(
-            bob, group, UUID.randomUUID(), new SettlementInput(a.id(), "10", PaymentMethod.FPS));
-    concurrent(
-        () -> ledger.transition(alice, payment.id(), "confirm"),
-        () -> ledger.transition(alice, payment.id(), "confirm"));
-    assertThat(balance(b.id())).isZero();
-    assertThat(
-            db.sql("SELECT count(*) FROM audit_event WHERE action='SETTLEMENT_CONFIRMED'")
-                .query(Long.class)
-                .single())
-        .isEqualTo(1);
+    ExpenseInput bad =
+        new ExpenseInput(
+            a.id(),
+            "Bad",
+            Category.OTHER,
+            "100.00",
+            SplitMethod.EXACT,
+            DAY,
+            List.of(new Participant(a.id(), "60.00"), new Participant(b.id(), "30.00")),
+            null);
+    assertThatThrownBy(() -> ledger.createExpense(id, a.id(), key, bad))
+        .hasMessage("SPLIT_TOTAL_MISMATCH");
+    assertThat(db.sql("SELECT count(*) FROM idempotency").query(Long.class).single()).isZero();
+    assertThat(db.sql("SELECT count(*) FROM expense").query(Long.class).single()).isZero();
+    assertThatThrownBy(
+            () ->
+                ledger.createExpense(
+                    id,
+                    a.id(),
+                    key,
+                    new ExpenseInput(
+                        a.id(),
+                        "Future",
+                        Category.OTHER,
+                        "1.00",
+                        SplitMethod.EQUAL,
+                        LocalDate.now().plusDays(2),
+                        List.of(new Participant(a.id(), null)),
+                        null)))
+        .hasMessage("INVALID_DATE");
+    Group other = groups.create(new GroupInput("Other", "🍜", List.of("Zed")));
+    UUID stranger = groups.members(other.id()).get(0).id();
+    assertThatThrownBy(
+            () ->
+                ledger.createExpense(
+                    id,
+                    a.id(),
+                    key,
+                    new ExpenseInput(
+                        stranger,
+                        "Cross",
+                        Category.OTHER,
+                        "1.00",
+                        SplitMethod.EQUAL,
+                        DAY,
+                        List.of(new Participant(a.id(), null)),
+                        null)))
+        .hasMessage("UNKNOWN_MEMBER");
+    assertThatThrownBy(
+            () ->
+                ledger.createTransfer(
+                    id,
+                    a.id(),
+                    key,
+                    new TransferInput(a.id(), a.id(), "1.00", PaymentMethod.CASH, DAY)))
+        .hasMessage("SAME_MEMBER");
   }
 
   @Test
-  void authenticationAndApiValidationAreEnforced() throws Exception {
-    mvc.perform(get("/api/v1/groups")).andExpect(status().isUnauthorized());
-    mvc.perform(get("/api/v1/groups").header("X-Demo-User", alice))
-        .andExpect(status().isUnauthorized());
-    mvc.perform(get("/api/config"))
-        .andExpect(status().isOk())
-        .andExpect(jsonPath("$.demo").value(false))
-        .andExpect(jsonPath("$.demoUsers").isEmpty());
-    mvc.perform(get("/health")).andExpect(status().isOk());
-    mvc.perform(
-            post("/api/v1/groups")
-                .with(jwt().jwt(j -> j.subject(alice.toString())))
-                .contentType("application/json")
-                .content("{\"name\":\"   \"}"))
-        .andExpect(status().isBadRequest());
-    mvc.perform(
-            post("/api/v1/groups/" + group + "/expenses")
-                .with(jwt().jwt(j -> j.subject(alice.toString())))
-                .contentType("application/json")
-                .content("{}"))
-        .andExpect(status().isBadRequest());
-    mvc.perform(
-            get("/api/v1/groups/" + group + "/expenses?offset=-1")
-                .with(jwt().jwt(j -> j.subject(alice.toString()))))
-        .andExpect(status().isBadRequest());
+  void editsRejectStaleVersionsAndDeletesRestoreBalances() {
+    Expense created = ledger.createExpense(id, a.id(), UUID.randomUUID(), dinner("90.00", null));
+    Expense edited = ledger.editExpense(id, b.id(), created.id(), dinner("120.00", 0));
+    assertThat(edited.version()).isEqualTo(1);
+    assertThat(balance(b.id())).isEqualTo(-4000);
+    assertThatThrownBy(() -> ledger.editExpense(id, b.id(), created.id(), dinner("150.00", 0)))
+        .hasMessage("STALE_VERSION");
+    ledger.deleteExpense(id, c.id(), created.id());
+    assertThat(balance(a.id())).isZero();
+    assertThat(ledger.snapshot(group.code()).expenses()).isEmpty();
+    assertThatThrownBy(() -> ledger.deleteExpense(id, c.id(), created.id()))
+        .hasMessage("NOT_FOUND");
+    assertThat(groups.activity(id, 0).items())
+        .extracting(Activity::action)
+        .containsExactly("EXPENSE_DELETED", "EXPENSE_EDITED", "EXPENSE_ADDED", "GROUP_CREATED");
   }
 
   @Test
-  void apiContractCreatesAnExpenseAndConfirmsItsRepayment() throws Exception {
-    String response =
+  void membersAreUniquePerGroupAndCapped() {
+    assertThatThrownBy(() -> groups.addMember(id, a.id(), new MemberInput(" alice ")))
+        .hasMessage("DUPLICATE_MEMBER");
+    Member dave = groups.addMember(id, a.id(), new MemberInput("  Dave   Wong "));
+    assertThat(dave.name()).isEqualTo("Dave Wong");
+    assertThat(groups.members(id))
+        .extracting(Member::name)
+        .containsExactly("Alice", "Bob", "Carol", "Dave Wong");
+    assertThatThrownBy(() -> groups.renameMember(id, a.id(), dave.id(), new MemberInput("Bob")))
+        .hasMessage("DUPLICATE_MEMBER");
+    assertThat(groups.create(new GroupInput("Dup", null, List.of("X", "X", "Y"))).id())
+        .satisfies(g -> assertThat(groups.members(g)).hasSize(2));
+    assertThat(balance(dave.id())).isZero();
+  }
+
+  @Test
+  void concurrentDuplicateCreatesApplyOnce() throws Exception {
+    UUID key = UUID.randomUUID();
+    ExecutorService pool = Executors.newFixedThreadPool(6);
+    try {
+      List<Future<Expense>> results = new ArrayList<>();
+      for (int i = 0; i < 6; i++)
+        results.add(
+            pool.submit(() -> ledger.createExpense(id, a.id(), key, dinner("60.00", null))));
+      Set<UUID> ids = new HashSet<>();
+      for (Future<Expense> f : results) ids.add(f.get().id());
+      assertThat(ids).hasSize(1);
+    } finally {
+      pool.shutdownNow();
+    }
+    assertThat(ledger.snapshot(group.code()).expenses()).hasSize(1);
+  }
+
+  @Test
+  void apiContractCreatesGroupExpenseAndTransfer() throws Exception {
+    String created =
         mvc.perform(
-                post("/api/v1/groups/" + group + "/expenses")
-                    .with(jwt().jwt(j -> j.subject(alice.toString())))
-                    .header("Idempotency-Key", UUID.randomUUID())
-                    .contentType("application/json")
-                    .content(json.writeValueAsString(dinner("30", null))))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.amountMinor").value(3000))
-            .andReturn()
-            .getResponse()
-            .getContentAsString();
-    Expense created = json.readValue(response, Expense.class);
-    assertThat(created.shares()).hasSize(3);
-    String repayment =
-        mvc.perform(
-                post("/api/v1/groups/" + group + "/settlements")
-                    .with(jwt().jwt(j -> j.subject(bob.toString())))
-                    .header("Idempotency-Key", UUID.randomUUID())
-                    .contentType("application/json")
+                post("/api/v1/groups")
+                    .contentType(MediaType.APPLICATION_JSON)
                     .content(
-                        json.writeValueAsString(
-                            new SettlementInput(a.id(), "10", PaymentMethod.FPS))))
+                        "{\"name\":\"Japan Trip\",\"emoji\":\"🗼\",\"members\":[\"Ka Yan\",\"Ming\"]}"))
             .andExpect(status().isOk())
-            .andExpect(jsonPath("$.status").value("PENDING"))
+            .andExpect(jsonPath("$.emoji").value("🗼"))
             .andReturn()
             .getResponse()
             .getContentAsString();
-    Settlement payment = json.readValue(repayment, Settlement.class);
+    String code = json.readTree(created).get("code").asString();
+    String snapshot =
+        mvc.perform(get("/api/v1/g/" + code))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.members.length()").value(2))
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String kaYan = json.readTree(snapshot).get("members").get(0).get("id").asString();
+    String ming = json.readTree(snapshot).get("members").get(1).get("id").asString();
+    String expense =
+        """
+        {"payerMemberId":"%s","description":"Ramen","category":"FOOD","amount":"200.50",
+         "splitMethod":"EQUAL","incurredOn":"2026-01-01",
+         "participants":[{"memberId":"%s"},{"memberId":"%s"}]}
+        """
+            .formatted(kaYan, kaYan, ming);
     mvc.perform(
-            post("/api/v1/settlements/" + payment.id() + "/confirm")
-                .with(jwt().jwt(j -> j.subject(alice.toString()))))
-        .andExpect(status().isOk())
-        .andExpect(jsonPath("$.status").value("CONFIRMED"));
-    assertThat(balance(b.id())).isZero();
-    String invalid =
-        "{\"description\":\"Null participant\",\"amount\":\"1\",\"payerMemberId\":\""
-            + a.id()
-            + "\",\"splitMethod\":\"EQUAL\",\"incurredOn\":\"2026-01-01\",\"participants\":[null]}";
+            post("/api/v1/g/" + code + "/expenses")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(expense))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("INVALID_INPUT"));
     mvc.perform(
-            post("/api/v1/groups/" + group + "/expenses")
-                .with(jwt().jwt(j -> j.subject(alice.toString())))
+            post("/api/v1/g/" + code + "/expenses")
                 .header("Idempotency-Key", UUID.randomUUID())
-                .contentType("application/json")
-                .content(invalid))
-        .andExpect(status().isBadRequest());
-  }
-
-  @Test
-  void concurrentEditsAllowOnlyOneVersionAndKeepSharesConsistent() throws Exception {
-    Expense initial = ledger.createExpense(alice, group, UUID.randomUUID(), dinner("30", null));
-    Callable<String> edit =
-        () -> {
-          try {
-            return ledger.edit(alice, initial.id(), dinner("60", 0)).description();
-          } catch (ApiException error) {
-            return error.getMessage();
-          }
-        };
-    assertThat(concurrent(edit, edit)).containsExactlyInAnyOrder("Dinner", "STALE_VERSION");
-    assertThat(
-            ledger.expense(alice, initial.id()).shares().stream()
-                .mapToLong(Share::amountMinor)
-                .sum())
-        .isEqualTo(6000);
-    assertThat(balance(a.id())).isEqualTo(4000);
-  }
-
-  @Test
-  void concurrentInvitationRedemptionAdmitsOneNewMember() throws Exception {
-    UUID stranger = UUID.randomUUID();
-    groups.profile(stranger, new Profile("Stranger"));
-    Invite invite = groups.invite(alice, group);
-    Callable<String> one =
-        () -> {
-          try {
-            return groups.accept(outsider, invite.token()).name();
-          } catch (ApiException error) {
-            return error.getMessage();
-          }
-        };
-    Callable<String> two =
-        () -> {
-          try {
-            return groups.accept(stranger, invite.token()).name();
-          } catch (ApiException error) {
-            return error.getMessage();
-          }
-        };
-    assertThat(concurrent(one, two)).containsExactlyInAnyOrder("Dinner", "INVITE_USED");
-    assertThat(groups.members(alice, group)).hasSize(4);
+                .header("X-Member", kaYan)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(expense))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.shares[0].amountMinor").value(10025));
+    mvc.perform(
+            post("/api/v1/g/" + code + "/expenses")
+                .header("Idempotency-Key", UUID.randomUUID())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(expense.replace("\"200.50\"", "\"200.505\"")))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.code").value("INVALID_AMOUNT"));
+    mvc.perform(
+            post("/api/v1/g/" + code + "/transfers")
+                .header("Idempotency-Key", UUID.randomUUID())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(
+                    """
+                    {"fromMemberId":"%s","toMemberId":"%s","amount":"100.25","method":"FPS","incurredOn":"2026-01-02"}
+                    """
+                        .formatted(ming, kaYan)))
+        .andExpect(status().isOk());
+    mvc.perform(get("/api/v1/g/" + code))
+        .andExpect(jsonPath("$.balances[0].amountMinor").value(0))
+        .andExpect(jsonPath("$.balances[1].amountMinor").value(0))
+        .andExpect(jsonPath("$.suggestions.length()").value(0));
+    mvc.perform(get("/api/v1/g/" + code + "/activity"))
+        .andExpect(jsonPath("$.items.length()").value(3))
+        .andExpect(jsonPath("$.items[1].actorMemberId").value(kaYan));
+    mvc.perform(
+            post("/api/v1/g/" + code + "/members")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"name\":\"Ming\"}"))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.code").value("DUPLICATE_MEMBER"));
+    mvc.perform(
+            patch("/api/v1/g/" + code)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"name\":\"Tokyo 2026\"}"))
+        .andExpect(jsonPath("$.name").value("Tokyo 2026"))
+        .andExpect(jsonPath("$.emoji").value("🐻"));
   }
 }

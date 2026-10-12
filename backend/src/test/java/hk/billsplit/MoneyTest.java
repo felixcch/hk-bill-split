@@ -79,7 +79,10 @@ class MoneyTest {
   @Test
   void suggestedTransfersClearEveryBalance() {
     List<Balance> original =
-        List.of(new Balance(C, -2000), new Balance(B, -3000), new Balance(A, 5000));
+        List.of(
+            new Balance(C, -2000, 0, 2000),
+            new Balance(B, -3000, 0, 3000),
+            new Balance(A, 5000, 5000, 0));
     Map<UUID, Long> remaining = new HashMap<>();
     original.forEach(b -> remaining.put(b.memberId(), b.amountMinor()));
     List<Suggestion> suggestions = Money.suggest(original);
